@@ -1,24 +1,5 @@
-// netlify/functions/process-invoice.js - Real OCR version
-const { ImageAnnotatorClient } = require('@google-cloud/vision');
-
-// Initialize Google Vision client
-let vision;
-try {
-  // Decode the base64 credentials
-  const credentials = JSON.parse(
-    Buffer.from(process.env.GOOGLE_APPLICATION_CREDENTIALS, 'base64').toString()
-  );
-  
-  vision = new ImageAnnotatorClient({
-    credentials: credentials,
-    projectId: process.env.GOOGLE_CLOUD_PROJECT_ID,
-  });
-} catch (error) {
-  console.error('Failed to initialize Google Vision:', error);
-}
-
+// netlify/functions/process-invoice.js - Working version
 exports.handler = async (event, context) => {
-  // Enable CORS
   const headers = {
     'Access-Control-Allow-Origin': '*',
     'Access-Control-Allow-Headers': 'Content-Type',
@@ -39,31 +20,54 @@ exports.handler = async (event, context) => {
   }
 
   try {
-    console.log('Processing invoice with Google Vision...');
+    console.log('Starting invoice processing...');
     
-    if (!vision) {
-      throw new Error('Google Vision not properly configured. Check environment variables.');
+    // Initialize Google Vision with proper error handling
+    let vision;
+    try {
+      const { ImageAnnotatorClient } = require('@google-cloud/vision');
+      
+      // Decode credentials from base64
+      const credentialsBase64 = process.env.GOOGLE_APPLICATION_CREDENTIALS;
+      const projectId = process.env.GOOGLE_CLOUD_PROJECT_ID;
+      
+      console.log('Decoding credentials...');
+      const credentialsJson = Buffer.from(credentialsBase64, 'base64').toString();
+      const credentials = JSON.parse(credentialsJson);
+      
+      console.log('Creating Vision client...');
+      vision = new ImageAnnotatorClient({
+        credentials: credentials,
+        projectId: projectId,
+      });
+      
+      console.log('Vision client created successfully');
+      
+    } catch (initError) {
+      console.error('Failed to initialize Google Vision:', initError);
+      throw new Error(`Google Vision initialization failed: ${initError.message}`);
     }
 
-    // Parse multipart form data
-    const boundary = event.headers['content-type'].split('boundary=')[1];
-    const parts = parseMultipartForm(event.body, boundary);
+    // Parse the uploaded file
+    console.log('Parsing uploaded file...');
+    const boundary = event.headers['content-type']?.split('boundary=')[1];
+    if (!boundary) {
+      throw new Error('No boundary found in content-type header');
+    }
     
+    const parts = parseMultipartForm(event.body, boundary);
     const file = parts.file;
-    const provider = parts.provider;
-
+    
     if (!file) {
       throw new Error('No file uploaded');
     }
 
-    console.log(`Processing with provider: ${provider}`);
-    console.log(`File size: ${file.data.length} bytes`);
+    console.log(`Processing file: ${file.filename}, size: ${file.data.length} bytes`);
 
     // Process with Google Vision
-    const result = await processWithGoogleVision(file);
+    const result = await processWithGoogleVision(vision, file);
     
-    console.log('OCR processing complete:', result);
-
+    console.log('OCR processing complete, returning result');
     return {
       statusCode: 200,
       headers,
@@ -71,7 +75,7 @@ exports.handler = async (event, context) => {
     };
 
   } catch (error) {
-    console.error('OCR processing error:', error);
+    console.error('Invoice processing error:', error);
     return {
       statusCode: 500,
       headers,
@@ -83,12 +87,13 @@ exports.handler = async (event, context) => {
   }
 };
 
-async function processWithGoogleVision(file) {
+async function processWithGoogleVision(vision, file) {
   try {
     console.log('Starting Google Vision text detection...');
     
-    // Convert base64 to buffer if needed
+    // Convert to buffer
     const imageBuffer = Buffer.isBuffer(file.data) ? file.data : Buffer.from(file.data, 'base64');
+    console.log(`Image buffer size: ${imageBuffer.length} bytes`);
     
     // Perform text detection
     const [result] = await vision.textDetection({
@@ -97,24 +102,33 @@ async function processWithGoogleVision(file) {
 
     const detections = result.textAnnotations;
     if (!detections || detections.length === 0) {
-      throw new Error('No text detected in the image');
+      console.log('No text detected, returning fallback');
+      return {
+        supplier: 'No Text Detected',
+        items: [{
+          description: 'Unable to extract text from image',
+          quantity: 1,
+          unitPrice: 0,
+          unit: 'each'
+        }]
+      };
     }
 
     const fullText = detections[0].description;
-    console.log('Extracted text length:', fullText.length);
+    console.log(`Extracted text length: ${fullText.length} characters`);
     
-    // Parse the extracted text to find invoice data
+    // Parse the text
     const parsedData = parseInvoiceText(fullText);
     
     return {
       supplier: parsedData.supplier,
       items: parsedData.items,
-      rawText: fullText.substring(0, 500) + '...' // First 500 chars for debugging
+      extractedTextLength: fullText.length
     };
 
-  } catch (error) {
-    console.error('Google Vision error:', error);
-    throw new Error(`Google Vision processing failed: ${error.message}`);
+  } catch (visionError) {
+    console.error('Google Vision error:', visionError);
+    throw new Error(`OCR processing failed: ${visionError.message}`);
   }
 }
 
@@ -122,116 +136,96 @@ function parseInvoiceText(text) {
   console.log('Parsing invoice text...');
   
   const lines = text.split('\n').filter(line => line.trim());
-  console.log(`Processing ${lines.length} lines of text`);
+  console.log(`Processing ${lines.length} lines`);
   
-  // Try to find supplier name (usually at the top)
+  // Find supplier (first meaningful line)
   let supplier = 'Unknown Supplier';
-  for (let i = 0; i < Math.min(10, lines.length); i++) {
+  for (let i = 0; i < Math.min(8, lines.length); i++) {
     const line = lines[i].trim();
-    // Skip obvious non-supplier lines
-    if (line.length > 5 && 
+    if (line.length > 3 && 
         !line.match(/^\d+/) && 
         !line.toLowerCase().includes('invoice') &&
         !line.toLowerCase().includes('tax') &&
-        !line.toLowerCase().includes('gst') &&
         !line.toLowerCase().includes('date') &&
         !line.match(/^\$/) &&
         !line.match(/\d{2}\/\d{2}\/\d{4}/)) {
       supplier = line;
-      console.log('Found supplier:', supplier);
+      console.log(`Found supplier: ${supplier}`);
       break;
     }
   }
 
-  // Enhanced item parsing - look for various patterns
+  // Parse items - look for price patterns
   const items = [];
   
-  // Pattern 1: Product Quantity Unit Price (most common)
-  const pattern1 = /(.+?)\s+(\d+(?:\.\d+)?)\s+(\w+)?\s*\$?(\d+(?:\.\d+)?)/;
-  
-  // Pattern 2: Product $Price Quantity
-  const pattern2 = /(.+?)\s+\$(\d+(?:\.\d+)?)\s+(\d+(?:\.\d+)?)/;
-  
-  // Pattern 3: Just Product and Price
-  const pattern3 = /(.+?)\s+\$(\d+(?:\.\d+)?)/;
-
+  // Look for lines with prices
   for (const line of lines) {
     const cleanLine = line.trim();
     
-    // Skip obvious header/footer lines
-    if (cleanLine.toLowerCase().includes('invoice') ||
-        cleanLine.toLowerCase().includes('total') ||
+    // Skip headers and totals
+    if (cleanLine.toLowerCase().includes('total') ||
         cleanLine.toLowerCase().includes('subtotal') ||
         cleanLine.toLowerCase().includes('gst') ||
         cleanLine.toLowerCase().includes('tax') ||
-        cleanLine.match(/^\d{2}\/\d{2}\/\d{4}/) ||
+        cleanLine.toLowerCase().includes('invoice') ||
         cleanLine.length < 3) {
       continue;
     }
 
-    // Try pattern 1 first
-    let match = cleanLine.match(pattern1);
-    if (match) {
-      const [, description, quantity, unit, price] = match;
-      items.push({
-        description: description.trim(),
-        quantity: parseFloat(quantity),
-        unitPrice: parseFloat(price),
-        unit: unit || 'each'
-      });
-      console.log('Pattern 1 match:', { description: description.trim(), quantity, price });
-      continue;
-    }
-
-    // Try pattern 2
-    match = cleanLine.match(pattern2);
-    if (match) {
-      const [, description, price, quantity] = match;
-      items.push({
-        description: description.trim(),
-        quantity: parseFloat(quantity),
-        unitPrice: parseFloat(price),
-        unit: 'each'
-      });
-      console.log('Pattern 2 match:', { description: description.trim(), quantity, price });
-      continue;
-    }
-
-    // Try pattern 3 (assume quantity 1)
-    match = cleanLine.match(pattern3);
-    if (match && parseFloat(match[2]) > 0.50) { // Only if price > $0.50
-      const [, description, price] = match;
-      items.push({
-        description: description.trim(),
-        quantity: 1,
-        unitPrice: parseFloat(price),
-        unit: 'each'
-      });
-      console.log('Pattern 3 match:', { description: description.trim(), price });
-    }
-  }
-
-  // If no structured items found, create fallback items from price patterns
-  if (items.length === 0) {
-    console.log('No structured items found, looking for price patterns...');
-    const priceMatches = text.match(/\$\d+(?:\.\d+)?/g);
-    if (priceMatches && priceMatches.length > 0) {
-      // Take the first few prices and create generic items
-      priceMatches.slice(0, 3).forEach((priceStr, index) => {
-        const price = parseFloat(priceStr.replace('$', ''));
-        if (price > 0.50) { // Reasonable minimum price
+    // Pattern: anything with a price
+    const priceMatch = cleanLine.match(/(.+?)\s*\$?(\d+(?:\.\d{2})?)/);
+    if (priceMatch) {
+      const [, description, priceStr] = priceMatch;
+      const price = parseFloat(priceStr);
+      
+      if (price > 0.50 && price < 10000) { // Reasonable price range
+        // Look for quantity in the description
+        const qtyMatch = description.match(/(\d+(?:\.\d+)?)\s*(.+)/);
+        if (qtyMatch) {
+          const [, qtyStr, desc] = qtyMatch;
           items.push({
-            description: `Invoice Item ${index + 1}`,
+            description: desc.trim(),
+            quantity: parseFloat(qtyStr),
+            unitPrice: price,
+            unit: 'each'
+          });
+        } else {
+          items.push({
+            description: description.trim(),
             quantity: 1,
             unitPrice: price,
             unit: 'each'
           });
         }
+        
+        console.log(`Found item: ${description.trim()} - $${price}`);
+      }
+    }
+  }
+
+  // If no items found, create one from any price
+  if (items.length === 0) {
+    const priceMatches = text.match(/\$(\d+(?:\.\d{2})?)/g);
+    if (priceMatches && priceMatches.length > 0) {
+      const price = parseFloat(priceMatches[0].replace('$', ''));
+      items.push({
+        description: 'Invoice Item',
+        quantity: 1,
+        unitPrice: price,
+        unit: 'each'
+      });
+    } else {
+      // Absolute fallback
+      items.push({
+        description: 'Text extracted but no prices found',
+        quantity: 1,
+        unitPrice: 0,
+        unit: 'each'
       });
     }
   }
 
-  console.log(`Parsed ${items.length} items from invoice`);
+  console.log(`Parsed ${items.length} items`);
   return { supplier, items };
 }
 
@@ -240,7 +234,6 @@ function parseMultipartForm(body, boundary) {
   const boundaryBuffer = Buffer.from(`--${boundary}`);
   const bodyBuffer = Buffer.from(body, 'base64');
   
-  // Split by boundary
   const sections = [];
   let start = 0;
   let boundaryIndex = bodyBuffer.indexOf(boundaryBuffer, start);
@@ -253,7 +246,6 @@ function parseMultipartForm(body, boundary) {
     boundaryIndex = bodyBuffer.indexOf(boundaryBuffer, start);
   }
   
-  // Parse each section
   for (const section of sections) {
     if (section.length === 0) continue;
     
@@ -263,14 +255,12 @@ function parseMultipartForm(body, boundary) {
     const headers = section.slice(0, headerEndIndex).toString();
     const content = section.slice(headerEndIndex + 4);
     
-    // Extract field name
     const nameMatch = headers.match(/name="([^"]+)"/);
     if (!nameMatch) continue;
     
     const fieldName = nameMatch[1];
     
     if (fieldName === 'file') {
-      // Extract filename and content type
       const filenameMatch = headers.match(/filename="([^"]+)"/);
       const contentTypeMatch = headers.match(/Content-Type:\s*([^\r\n]+)/);
       
@@ -280,7 +270,6 @@ function parseMultipartForm(body, boundary) {
         data: content
       };
     } else {
-      // Regular form field
       parts[fieldName] = content.toString().trim();
     }
   }
