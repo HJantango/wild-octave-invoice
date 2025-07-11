@@ -1,0 +1,528 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Wild Octave Organics - Invoice Processor</title>
+    <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body>
+    <div id="root"></div>
+    <script type="text/babel">
+        const { useState, useRef } = React;
+
+        function InvoiceProcessor() {
+          const [currentStep, setCurrentStep] = useState(1);
+          const [invoiceFile, setInvoiceFile] = useState(null);
+          const [ocrProvider, setOcrProvider] = useState('google-vision');
+          const [extractedItems, setExtractedItems] = useState([]);
+          const [supplierName, setSupplierName] = useState('');
+          const [processingStatus, setProcessingStatus] = useState('');
+          const [isProcessing, setIsProcessing] = useState(false);
+          const [copiedField, setCopiedField] = useState('');
+          const fileInputRef = useRef(null);
+
+          const categoryMarkups = {
+            'House': 1.65,
+            'Bulk': 1.75,
+            'Fruit & Veg': 1.75,
+            'Fridge & Freezer': 1.5,
+            'Naturo': 1.65,
+            'Groceries': 1.65,
+            'Drinks Fridge': 1.65,
+            'Supplements': 1.65,
+            'Personal Care': 1.65,
+            'Fresh Bread': 1.5
+          };
+
+          const ocrProviders = [
+            { id: 'google-vision', name: 'Google Cloud Vision', cost: '$1.50/1000 pages', accuracy: '95%' },
+            { id: 'mindee', name: 'Mindee Invoice API', cost: '$0.10/page (250 free/month)', accuracy: '97%' },
+            { id: 'azure-di', name: 'Azure Document Intelligence', cost: '$1.00/1000 pages', accuracy: '96%' }
+          ];
+
+          const handleFileUpload = (event) => {
+            const file = event.target.files[0];
+            if (file) {
+              const validTypes = ['application/pdf', 'image/jpeg', 'image/jpg', 'image/png'];
+              if (!validTypes.includes(file.type)) {
+                alert('Please upload a PDF or image file (JPG, PNG)');
+                return;
+              }
+              
+              if (file.size > 10 * 1024 * 1024) {
+                alert('File size must be less than 10MB');
+                return;
+              }
+              
+              setInvoiceFile(file);
+              setCurrentStep(2);
+            }
+          };
+
+          const copyToClipboard = async (text, label) => {
+            try {
+              await navigator.clipboard.writeText(text);
+              setCopiedField(label);
+              setTimeout(() => setCopiedField(''), 1000);
+            } catch (err) {
+              console.error('Failed to copy: ', err);
+              setCopiedField(label);
+              setTimeout(() => setCopiedField(''), 1000);
+            }
+          };
+
+          const testFunction = async () => {
+            try {
+              console.log('Testing function...');
+              const response = await fetch('/.netlify/functions/process-invoice', {
+                method: 'GET'
+              });
+              const text = await response.text();
+              console.log('Function response:', text);
+              alert(`Function test result (${response.status}): ${text.substring(0, 200)}...`);
+            } catch (error) {
+              console.error('Function test error:', error);
+              alert(`Function test error: ${error.message}`);
+            }
+          };
+
+          const processInvoice = async () => {
+            setIsProcessing(true);
+            setProcessingStatus('Uploading file...');
+            
+            try {
+              const formData = new FormData();
+              formData.append('file', invoiceFile);
+              formData.append('provider', ocrProvider);
+              
+              setProcessingStatus('Processing with ' + ocrProviders.find(p => p.id === ocrProvider).name + '...');
+              
+              const response = await fetch('/.netlify/functions/process-invoice', {
+                method: 'POST',
+                body: formData
+              });
+              
+              const responseText = await response.text();
+              console.log('Response status:', response.status);
+              console.log('Response text:', responseText);
+              
+              if (!response.ok) {
+                throw new Error(`API Error (${response.status}): ${responseText.substring(0, 200)}...`);
+              }
+              
+              let result;
+              try {
+                result = JSON.parse(responseText);
+              } catch (parseError) {
+                throw new Error(`Invalid JSON response: ${responseText.substring(0, 200)}...`);
+              }
+              
+              setProcessingStatus('Parsing extracted data...');
+              
+              if (!result.items || !Array.isArray(result.items)) {
+                throw new Error('Invalid response format: missing items array');
+              }
+              
+              const processedItems = result.items.map((item, index) => ({
+                id: index + 1,
+                product: item.description || item.product || 'Unknown Item',
+                quantity: parseFloat(item.quantity) || 1,
+                unit: item.unit || 'each',
+                unitCostIncGST: parseFloat(item.unitPrice) || 0,
+                unitCostExGST: ((parseFloat(item.unitPrice) || 0) / 1.1).toFixed(2),
+                category: 'Groceries',
+                markup: categoryMarkups['Groceries'],
+                retailPrice: (((parseFloat(item.unitPrice) || 0) / 1.1) * categoryMarkups['Groceries'] * 1.1).toFixed(2),
+                customMarkup: '',
+                useCustomMarkup: false
+              }));
+
+              setExtractedItems(processedItems);
+              setSupplierName(result.supplier || 'Unknown Supplier');
+              setProcessingStatus(`Complete! Found ${processedItems.length} items.`);
+              setCurrentStep(3);
+              
+            } catch (error) {
+              console.error('OCR processing error:', error);
+              setProcessingStatus('Error: ' + error.message);
+              alert(`Failed to process invoice:\n\n${error.message}\n\nPlease check the browser console for more details.`);
+            } finally {
+              setIsProcessing(false);
+            }
+          };
+
+          const updateItemCategory = (itemId, newCategory) => {
+            setExtractedItems(items => items.map(item => {
+              if (item.id === itemId) {
+                const newMarkup = categoryMarkups[newCategory];
+                const newRetailPrice = ((parseFloat(item.unitCostExGST) * newMarkup) * 1.1).toFixed(2);
+                return {
+                  ...item,
+                  category: newCategory,
+                  markup: newMarkup,
+                  retailPrice: newRetailPrice,
+                  customMarkup: '',
+                  useCustomMarkup: false
+                };
+              }
+              return item;
+            }));
+          };
+
+          const updateCustomMarkup = (itemId, customMarkup) => {
+            setExtractedItems(items => items.map(item => {
+              if (item.id === itemId) {
+                const markup = customMarkup ? parseFloat(customMarkup) : item.markup;
+                const newRetailPrice = ((parseFloat(item.unitCostExGST) * markup) * 1.1).toFixed(2);
+                return {
+                  ...item,
+                  customMarkup: customMarkup,
+                  useCustomMarkup: !!customMarkup,
+                  markup: markup,
+                  retailPrice: newRetailPrice
+                };
+              }
+              return item;
+            }));
+          };
+
+          const removeItem = (itemId) => {
+            setExtractedItems(items => items.filter(item => item.id !== itemId));
+          };
+
+          const exportData = () => {
+            const csvContent = 'Product,Quantity,Unit,Cost Ex-GST,Category,Markup,Retail Price\n' +
+              extractedItems.map(item => 
+                `${item.product},${item.quantity},${item.unit},$${item.unitCostExGST},${item.category},${item.markup}x,$${item.retailPrice}`
+              ).join('\n');
+
+            const blob = new Blob([csvContent], { type: 'text/csv' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `${supplierName.replace(/\s+/g, '_')}_processed_invoice_${new Date().toISOString().split('T')[0]}.csv`;
+            a.click();
+            URL.revokeObjectURL(url);
+          };
+
+          const resetProcess = () => {
+            setCurrentStep(1);
+            setInvoiceFile(null);
+            setExtractedItems([]);
+            setSupplierName('');
+            setProcessingStatus('');
+            setIsProcessing(false);
+          };
+
+          const totalCost = extractedItems.reduce((sum, item) => sum + (parseFloat(item.unitCostExGST) * item.quantity), 0);
+          const totalRetail = extractedItems.reduce((sum, item) => sum + (parseFloat(item.retailPrice) * item.quantity), 0);
+          const totalProfit = totalRetail - totalCost;
+          const profitMargin = totalCost > 0 ? ((totalProfit / totalCost) * 100) : 0;
+
+          return (
+            <div className="max-w-6xl mx-auto p-6 bg-white min-h-screen">
+              <div className="mb-8">
+                <h1 className="text-4xl font-bold text-green-800 mb-2">Wild Octave Organics</h1>
+                <p className="text-gray-600 text-lg">Invoice Processing & Pricing Tool</p>
+              </div>
+
+              {/* Debug Info */}
+              <div className="mb-4 p-4 bg-yellow-50 border border-yellow-200 rounded">
+                <p className="text-sm text-yellow-800">
+                  <strong>Debug Info:</strong> Current Step: {currentStep}, File: {invoiceFile ? invoiceFile.name : 'None'}
+                </p>
+              </div>
+
+              {/* Progress Steps */}
+              <div className="flex items-center justify-between mb-8 bg-gray-50 p-6 rounded-lg">
+                <div className={`flex items-center ${currentStep >= 1 ? 'text-green-600' : 'text-gray-400'}`}>
+                  <div className={`w-10 h-10 rounded-full flex items-center justify-center ${currentStep >= 1 ? 'bg-green-600 text-white' : 'bg-gray-300'}`}>
+                    {currentStep > 1 ? '✓' : '1'}
+                  </div>
+                  <span className="ml-3 font-medium">Upload</span>
+                </div>
+                <div className={`flex items-center ${currentStep >= 2 ? 'text-green-600' : 'text-gray-400'}`}>
+                  <div className={`w-10 h-10 rounded-full flex items-center justify-center ${currentStep >= 2 ? 'bg-green-600 text-white' : 'bg-gray-300'}`}>
+                    {currentStep > 2 ? '✓' : '2'}
+                  </div>
+                  <span className="ml-3 font-medium">Process</span>
+                </div>
+                <div className={`flex items-center ${currentStep >= 3 ? 'text-green-600' : 'text-gray-400'}`}>
+                  <div className={`w-10 h-10 rounded-full flex items-center justify-center ${currentStep >= 3 ? 'bg-green-600 text-white' : 'bg-gray-300'}`}>
+                    {currentStep > 3 ? '✓' : '3'}
+                  </div>
+                  <span className="ml-3 font-medium">Review</span>
+                </div>
+              </div>
+
+              {/* Step 1: Upload */}
+              {currentStep === 1 && (
+                <div className="max-w-2xl mx-auto">
+                  <div className="border-2 border-dashed border-gray-300 rounded-lg p-12 text-center hover:border-green-400 transition-colors">
+                    <div className="mx-auto h-16 w-16 text-gray-400 mb-4 text-6xl">📁</div>
+                    <h3 className="text-xl font-medium text-gray-900 mb-2">Upload Invoice</h3>
+                    <p className="text-gray-600 mb-4">Select PDF or image file to process</p>
+                    <input
+                      ref={fileInputRef}
+                      type="file"
+                      accept=".pdf,.jpg,.jpeg,.png"
+                      onChange={handleFileUpload}
+                      className="hidden"
+                    />
+                    <button
+                      onClick={() => fileInputRef.current.click()}
+                      className="bg-green-600 text-white px-8 py-3 rounded-lg hover:bg-green-700 transition-colors font-medium"
+                    >
+                      Choose File
+                    </button>
+                  </div>
+                  
+                  <div className="bg-gray-50 p-6 rounded-lg mt-6">
+                    <h4 className="font-medium mb-4">OCR Provider</h4>
+                    <div className="grid grid-cols-1 gap-4">
+                      {ocrProviders.map(provider => (
+                        <label key={provider.id} className="flex items-center p-4 border rounded-lg cursor-pointer hover:bg-white">
+                          <input
+                            type="radio"
+                            name="ocrProvider"
+                            value={provider.id}
+                            checked={ocrProvider === provider.id}
+                            onChange={(e) => setOcrProvider(e.target.value)}
+                            className="mr-3"
+                          />
+                          <div className="flex-1">
+                            <div className="font-medium">{provider.name}</div>
+                            <div className="text-sm text-gray-600">{provider.cost}</div>
+                            <div className="text-sm text-green-600">Accuracy: {provider.accuracy}</div>
+                          </div>
+                        </label>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {/* Step 2: Processing */}
+              {currentStep === 2 && (
+                <div className="max-w-2xl mx-auto text-center">
+                  <div className="mx-auto h-20 w-20 text-green-600 mb-6 text-8xl">📄</div>
+                  <h3 className="text-2xl font-medium mb-4">Ready to Process</h3>
+                  <div className="bg-gray-50 p-6 rounded-lg mb-6">
+                    <p className="text-gray-700 mb-2"><strong>File:</strong> {invoiceFile?.name}</p>
+                    <p className="text-gray-700 mb-2"><strong>Size:</strong> {(invoiceFile?.size / 1024 / 1024).toFixed(2)} MB</p>
+                    <p className="text-gray-700"><strong>Provider:</strong> {ocrProviders.find(p => p.id === ocrProvider)?.name}</p>
+                  </div>
+                  
+                  {processingStatus && (
+                    <div className="bg-blue-50 border border-blue-200 rounded-lg p-4 mb-6">
+                      <div className="flex items-center justify-center">
+                        {isProcessing && <div className="animate-spin rounded-full h-6 w-6 border-b-2 border-blue-600 mr-3"></div>}
+                        <p className="text-blue-800">{processingStatus}</p>
+                      </div>
+                    </div>
+                  )}
+                  
+                  {/* BUTTONS - This should show both buttons clearly */}
+                  <div className="space-y-4">
+                    <button
+                      onClick={processInvoice}
+                      disabled={isProcessing}
+                      className={`w-full px-8 py-4 rounded-lg font-medium transition-colors ${
+                        isProcessing 
+                          ? 'bg-gray-400 cursor-not-allowed' 
+                          : 'bg-green-600 hover:bg-green-700 text-white'
+                      }`}
+                    >
+                      <span className="inline mr-2">🧮</span>
+                      {isProcessing ? 'Processing...' : 'Process Invoice'}
+                    </button>
+                    
+                    {/* TEST FUNCTION BUTTON - VERY VISIBLE */}
+                    <button
+                      onClick={testFunction}
+                      className="w-full px-8 py-4 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors font-medium border-2 border-blue-800"
+                    >
+                      <span className="inline mr-2">🔧</span>
+                      TEST FUNCTION CONNECTION
+                    </button>
+                    
+                    <p className="text-sm text-gray-600">
+                      Use the test button above to check if the backend function is working
+                    </p>
+                  </div>
+                </div>
+              )}
+
+              {/* Step 3: Review */}
+              {currentStep === 3 && (
+                <div>
+                  <div className="flex flex-col md:flex-row justify-between items-start md:items-center mb-6 gap-4">
+                    <h3 className="text-2xl font-medium">Review Items</h3>
+                    <div className="flex gap-2 flex-wrap">
+                      <button
+                        onClick={resetProcess}
+                        className="bg-gray-500 text-white px-4 py-2 rounded-lg hover:bg-gray-600 transition-colors"
+                      >
+                        New Invoice
+                      </button>
+                      <button
+                        onClick={exportData}
+                        className="bg-green-600 text-white px-4 py-2 rounded-lg hover:bg-green-700 transition-colors"
+                      >
+                        <span className="inline mr-2">💾</span>
+                        Export CSV
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-1 md:grid-cols-4 gap-4 mb-6">
+                    <div className="bg-blue-50 p-4 rounded-lg">
+                      <p className="text-sm text-blue-600 font-medium">Supplier</p>
+                      <p className="text-lg font-bold text-blue-800">{supplierName}</p>
+                    </div>
+                    <div className="bg-green-50 p-4 rounded-lg">
+                      <p className="text-sm text-green-600 font-medium">Items</p>
+                      <p className="text-lg font-bold text-green-800">{extractedItems.length}</p>
+                    </div>
+                    <div className="bg-yellow-50 p-4 rounded-lg">
+                      <p className="text-sm text-yellow-600 font-medium">Total Cost</p>
+                      <p className="text-lg font-bold text-yellow-800">${totalCost.toFixed(2)}</p>
+                    </div>
+                    <div className="bg-purple-50 p-4 rounded-lg">
+                      <p className="text-sm text-purple-600 font-medium">Total Retail</p>
+                      <p className="text-lg font-bold text-purple-800">${totalRetail.toFixed(2)}</p>
+                    </div>
+                  </div>
+
+                  {/* Profit Summary */}
+                  <div className="bg-green-50 border border-green-200 rounded-lg p-4 mb-6">
+                    <div className="flex justify-between items-center">
+                      <div>
+                        <p className="text-sm text-green-600 font-medium">Estimated Profit</p>
+                        <p className="text-xl font-bold text-green-800">${totalProfit.toFixed(2)}</p>
+                      </div>
+                      <div className="text-right">
+                        <p className="text-sm text-green-600 font-medium">Margin</p>
+                        <p className="text-xl font-bold text-green-800">{profitMargin.toFixed(1)}%</p>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Copy feedback */}
+                  {copiedField && (
+                    <div className="fixed top-4 right-4 bg-green-100 border border-green-300 text-green-800 px-4 py-2 rounded-lg shadow-lg z-50">
+                      Copied {copiedField}!
+                    </div>
+                  )}
+
+                  <div className="bg-white border border-gray-200 rounded-lg shadow-sm overflow-hidden">
+                    <div className="overflow-x-auto">
+                      <table className="w-full">
+                        <thead className="bg-gray-50">
+                          <tr>
+                            <th className="px-4 py-3 text-left text-sm font-medium text-gray-900">Product</th>
+                            <th className="px-4 py-3 text-left text-sm font-medium text-gray-900">Qty</th>
+                            <th className="px-4 py-3 text-left text-sm font-medium text-gray-900">Unit</th>
+                            <th className="px-4 py-3 text-left text-sm font-medium text-gray-900">Cost Ex-GST</th>
+                            <th className="px-4 py-3 text-left text-sm font-medium text-gray-900">Category</th>
+                            <th className="px-4 py-3 text-left text-sm font-medium text-gray-900">Markup</th>
+                            <th className="px-4 py-3 text-left text-sm font-medium text-gray-900">Custom</th>
+                            <th className="px-4 py-3 text-left text-sm font-medium text-gray-900">Retail Price</th>
+                            <th className="px-4 py-3 text-left text-sm font-medium text-gray-900">Actions</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-gray-200">
+                          {extractedItems.map(item => (
+                            <tr key={item.id} className="hover:bg-gray-50">
+                              <td className="px-4 py-3 text-sm text-gray-900 font-medium">{item.product}</td>
+                              <td className="px-4 py-3 text-sm text-gray-900">{item.quantity}</td>
+                              <td className="px-4 py-3 text-sm text-gray-900">{item.unit}</td>
+                              <td className="px-4 py-3 text-sm text-gray-900">
+                                <button 
+                                  onClick={() => copyToClipboard(item.unitCostExGST, 'Cost Ex-GST')}
+                                  className="text-blue-600 hover:text-blue-800 hover:bg-blue-50 px-2 py-1 rounded cursor-pointer transition-colors"
+                                  title="Click to copy"
+                                >
+                                  ${item.unitCostExGST}
+                                </button>
+                              </td>
+                              <td className="px-4 py-3">
+                                <select
+                                  value={item.category}
+                                  onChange={(e) => updateItemCategory(item.id, e.target.value)}
+                                  disabled={item.useCustomMarkup}
+                                  className={`text-sm border border-gray-300 rounded px-2 py-1 focus:outline-none focus:ring-2 focus:ring-green-500 focus:border-green-500 ${
+                                    item.useCustomMarkup ? 'bg-gray-100 text-gray-500 cursor-not-allowed' : ''
+                                  }`}
+                                >
+                                  {Object.keys(categoryMarkups).map(category => (
+                                    <option key={category} value={category}>{category}</option>
+                                  ))}
+                                </select>
+                              </td>
+                              <td className="px-4 py-3 text-sm text-gray-900">
+                                <span className={item.useCustomMarkup ? 'text-gray-400' : ''}>
+                                  {item.markup}x
+                                </span>
+                              </td>
+                              <td className="px-4 py-3">
+                                <input
+                                  type="number"
+                                  step="0.01"
+                                  min="1"
+                                  max="10"
+                                  value={item.customMarkup}
+                                  onChange={(e) => updateCustomMarkup(item.id, e.target.value)}
+                                  placeholder="e.g. 2.5"
+                                  className="w-20 text-sm border border-gray-300 rounded px-2 py-1 focus:outline-none focus:ring-2 focus:ring-green-500 focus:border-green-500"
+                                />
+                                {item.useCustomMarkup && (
+                                  <div className="text-xs text-green-600 mt-1">Using custom</div>
+                                )}
+                              </td>
+                              <td className="px-4 py-3 text-sm font-medium">
+                                <button 
+                                  onClick={() => copyToClipboard(item.retailPrice, 'Retail Price')}
+                                  className="text-green-600 hover:text-green-800 hover:bg-green-50 px-2 py-1 rounded cursor-pointer transition-colors"
+                                  title="Click to copy"
+                                >
+                                  ${item.retailPrice}
+                                </button>
+                              </td>
+                              <td className="px-4 py-3">
+                                <button
+                                  onClick={() => removeItem(item.id)}
+                                  className="text-red-600 hover:text-red-800 hover:bg-red-50 p-1 rounded cursor-pointer transition-colors"
+                                  title="Remove item"
+                                >
+                                  🗑️
+                                </button>
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+
+                  {extractedItems.length === 0 && (
+                    <div className="text-center py-12 text-gray-500">
+                      <div className="mx-auto h-12 w-12 text-gray-400 mb-4 text-5xl">⚠️</div>
+                      <p>No items found. Try processing another invoice.</p>
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          );
+        }
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(React.createElement(InvoiceProcessor));
+    </script>
+</body>
+</html>
