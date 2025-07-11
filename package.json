@@ -1,5 +1,7 @@
-{
+json{
   "name": "wild-octave-invoice-processor",
   "version": "1.0.0",
-  "dependencies": {}
+  "dependencies": {
+    "@google-cloud/vision": "^4.0.2"
+  }
 }
