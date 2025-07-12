@@ -1,5 +1,5 @@
 // netlify/functions/process-invoice.js - Hybrid Azure + Abacus.ai Solution
-const { DocumentAnalysisClient, AzureKeyCredential } = require("@azure/ai-document-intelligence");
+const { DocumentAnalysisClient, AzureKeyCredential } = require("@azure/ai-form-recognizer");
 const axios = require('axios');
 
 // Configuration
