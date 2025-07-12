@@ -1,8 +1,12 @@
 {
   "name": "wild-octave-invoice-processor",
-  "version": "1.0.0",
-  "description": "Invoice processing tool with OCR capabilities",
+  "version": "2.0.0",
   "dependencies": {
-    "@google-cloud/vision": "^4.0.2"
+    "@azure/ai-document-intelligence": "^1.0.0",
+    "axios": "^1.6.0"
+  },
+  "scripts": {
+    "build": "echo 'Build complete'",
+    "deploy": "netlify deploy --prod"
   }
 }
