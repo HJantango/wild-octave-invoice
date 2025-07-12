@@ -2,7 +2,7 @@
   "name": "wild-octave-invoice-processor",
   "version": "2.0.0",
   "dependencies": {
-    "@azure/ai-document-intelligence": "^1.0.0",
+    "@azure/ai-form-recognizer": "^5.0.0",
     "axios": "^1.6.0"
   },
   "scripts": {
