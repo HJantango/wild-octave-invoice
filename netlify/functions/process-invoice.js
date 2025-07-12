@@ -1,4 +1,39 @@
-// netlify/functions/process-invoice.js - Working version
+// netlify/functions/process-invoice.js - Hybrid Azure + Abacus.ai Solution
+const { DocumentAnalysisClient, AzureKeyCredential } = require("@azure/ai-document-intelligence");
+const axios = require('axios');
+
+// Configuration
+const AZURE_CONFIG = {
+  endpoint: process.env.AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT,
+  key: process.env.AZURE_DOCUMENT_INTELLIGENCE_KEY
+};
+
+const ABACUS_CONFIG = {
+  endpoint: 'https://api.abacus.ai/v1/deployments/14fa057fbc/execute',
+  apiKey: process.env.ABACUS_API_KEY
+};
+
+// Business context for Wild Octave Organics
+const BUSINESS_CONTEXT = {
+  shop_name: "Wild Octave Organics",
+  typical_suppliers: [
+    "Biodynamic Supplies", 
+    "Organic Wholesalers", 
+    "Natural Foods Ltd",
+    "Pure Earth Trading",
+    "Green Valley Distributors"
+  ],
+  product_categories: {
+    organic: { markup: 0.45, keywords: ["organic", "bio", "certified organic"] },
+    supplements: { markup: 0.50, keywords: ["vitamin", "supplement", "mineral", "probiotic"] },
+    bulk: { markup: 0.35, keywords: ["bulk", "25kg", "20kg", "wholesale"] },
+    cosmetics: { markup: 0.55, keywords: ["cream", "oil", "soap", "shampoo"] },
+    groceries: { markup: 0.40, keywords: [] }
+  },
+  gst_rate: 0.10,
+  currency: "AUD"
+};
+
 exports.handler = async (event, context) => {
   const headers = {
     'Access-Control-Allow-Origin': '*',
@@ -20,62 +55,49 @@ exports.handler = async (event, context) => {
   }
 
   try {
-    console.log('Starting invoice processing...');
+    console.log('🔄 Starting hybrid invoice processing...');
     
-    // Initialize Google Vision with proper error handling
-    let vision;
-    try {
-      const { ImageAnnotatorClient } = require('@google-cloud/vision');
-      
-      // Decode credentials from base64
-      const credentialsBase64 = process.env.GOOGLE_APPLICATION_CREDENTIALS;
-      const projectId = process.env.GOOGLE_CLOUD_PROJECT_ID;
-      
-      console.log('Decoding credentials...');
-      const credentialsJson = Buffer.from(credentialsBase64, 'base64').toString();
-      const credentials = JSON.parse(credentialsJson);
-      
-      console.log('Creating Vision client...');
-      vision = new ImageAnnotatorClient({
-        credentials: credentials,
-        projectId: projectId,
-      });
-      
-      console.log('Vision client created successfully');
-      
-    } catch (initError) {
-      console.error('Failed to initialize Google Vision:', initError);
-      throw new Error(`Google Vision initialization failed: ${initError.message}`);
+    // Validate environment variables
+    if (!AZURE_CONFIG.endpoint || !AZURE_CONFIG.key) {
+      throw new Error('Azure Document Intelligence credentials not configured');
+    }
+    
+    if (!ABACUS_CONFIG.apiKey) {
+      throw new Error('Abacus.ai API key not configured');
     }
 
     // Parse the uploaded file
-    console.log('Parsing uploaded file...');
-    const boundary = event.headers['content-type']?.split('boundary=')[1];
-    if (!boundary) {
-      throw new Error('No boundary found in content-type header');
-    }
-    
-    const parts = parseMultipartForm(event.body, boundary);
+    console.log('📄 Parsing uploaded file...');
+    const parts = parseMultipartForm(event.body, event.headers['content-type']);
     const file = parts.file;
     
     if (!file) {
       throw new Error('No file uploaded');
     }
 
-    console.log(`Processing file: ${file.filename}, size: ${file.data.length} bytes`);
+    console.log(`Processing: ${file.filename}, size: ${file.data.length} bytes`);
 
-    // Process with Google Vision
-    const result = await processWithGoogleVision(vision, file);
+    // Step 1: Extract data with Azure Document Intelligence
+    console.log('🔍 Extracting data with Azure Document Intelligence...');
+    const azureData = await extractWithAzure(file);
     
-    console.log('OCR processing complete, returning result');
+    // Step 2: Enhance with Abacus.ai business logic
+    console.log('🧠 Applying business logic with Abacus.ai...');
+    const enhancedData = await enhanceWithAbacus(azureData);
+    
+    // Step 3: Format for your existing UI
+    console.log('✅ Formatting results...');
+    const formattedResult = formatForUI(enhancedData);
+    
+    console.log('🎉 Processing complete!');
     return {
       statusCode: 200,
       headers,
-      body: JSON.stringify(result)
+      body: JSON.stringify(formattedResult)
     };
 
   } catch (error) {
-    console.error('Invoice processing error:', error);
+    console.error('❌ Invoice processing error:', error);
     return {
       statusCode: 500,
       headers,
@@ -87,149 +109,211 @@ exports.handler = async (event, context) => {
   }
 };
 
-async function processWithGoogleVision(vision, file) {
+async function extractWithAzure(file) {
   try {
-    console.log('Starting Google Vision text detection...');
-    
-    // Convert to buffer
-    const imageBuffer = Buffer.isBuffer(file.data) ? file.data : Buffer.from(file.data, 'base64');
-    console.log(`Image buffer size: ${imageBuffer.length} bytes`);
-    
-    // Perform text detection
-    const [result] = await vision.textDetection({
-      image: { content: imageBuffer }
-    });
+    // Initialize Azure client
+    const client = new DocumentAnalysisClient(
+      AZURE_CONFIG.endpoint,
+      new AzureKeyCredential(AZURE_CONFIG.key)
+    );
 
-    const detections = result.textAnnotations;
-    if (!detections || detections.length === 0) {
-      console.log('No text detected, returning fallback');
-      return {
-        supplier: 'No Text Detected',
-        items: [{
-          description: 'Unable to extract text from image',
-          quantity: 1,
-          unitPrice: 0,
-          unit: 'each'
-        }]
-      };
+    // Convert file data to proper format
+    const imageBuffer = Buffer.isBuffer(file.data) ? file.data : Buffer.from(file.data, 'base64');
+    
+    // Start analysis
+    const poller = await client.beginAnalyzeDocument(
+      "prebuilt-invoice",
+      imageBuffer,
+      {
+        locale: "en-AU"
+      }
+    );
+
+    // Wait for completion
+    const result = await poller.pollUntilDone();
+    
+    if (!result.documents || result.documents.length === 0) {
+      throw new Error("No invoice data extracted from document");
     }
 
-    const fullText = detections[0].description;
-    console.log(`Extracted text length: ${fullText.length} characters`);
-    
-    // Parse the text
-    const parsedData = parseInvoiceText(fullText);
-    
-    return {
-      supplier: parsedData.supplier,
-      items: parsedData.items,
-      extractedTextLength: fullText.length
-    };
+    const invoice = result.documents[0];
+    return transformAzureData(invoice);
 
-  } catch (visionError) {
-    console.error('Google Vision error:', visionError);
-    throw new Error(`OCR processing failed: ${visionError.message}`);
+  } catch (error) {
+    console.error('Azure extraction error:', error);
+    // Fallback to basic text extraction if Azure fails
+    return createFallbackData(file);
   }
 }
 
-function parseInvoiceText(text) {
-  console.log('Parsing invoice text...');
+function transformAzureData(azureInvoice) {
+  const fields = azureInvoice.fields || {};
   
-  const lines = text.split('\n').filter(line => line.trim());
-  console.log(`Processing ${lines.length} lines`);
-  
-  // Find supplier (first meaningful line)
-  let supplier = 'Unknown Supplier';
-  for (let i = 0; i < Math.min(8, lines.length); i++) {
-    const line = lines[i].trim();
-    if (line.length > 3 && 
-        !line.match(/^\d+/) && 
-        !line.toLowerCase().includes('invoice') &&
-        !line.toLowerCase().includes('tax') &&
-        !line.toLowerCase().includes('date') &&
-        !line.match(/^\$/) &&
-        !line.match(/\d{2}\/\d{2}\/\d{4}/)) {
-      supplier = line;
-      console.log(`Found supplier: ${supplier}`);
-      break;
+  return {
+    supplier: {
+      name: fields.VendorName?.content || "Unknown Supplier",
+      address: fields.VendorAddress?.content || "",
+      abn: fields.VendorTaxId?.content || ""
+    },
+    invoice: {
+      number: fields.InvoiceId?.content || "",
+      date: fields.InvoiceDate?.content || "",
+      due_date: fields.DueDate?.content || "",
+      po_number: fields.PurchaseOrder?.content || ""
+    },
+    line_items: extractLineItems(fields.Items?.valueArray || []),
+    totals: {
+      subtotal_ex_gst: fields.SubTotal?.valueNumber || 0,
+      gst_amount: fields.TotalTax?.valueNumber || 0,
+      total_inc_gst: fields.InvoiceTotal?.valueNumber || 0
     }
-  }
+  };
+}
 
-  // Parse items - look for price patterns
-  const items = [];
-  
-  // Look for lines with prices
-  for (const line of lines) {
-    const cleanLine = line.trim();
+function extractLineItems(azureItems) {
+  return azureItems.map((item, index) => {
+    const itemFields = item.valueObject || {};
     
-    // Skip headers and totals
-    if (cleanLine.toLowerCase().includes('total') ||
-        cleanLine.toLowerCase().includes('subtotal') ||
-        cleanLine.toLowerCase().includes('gst') ||
-        cleanLine.toLowerCase().includes('tax') ||
-        cleanLine.toLowerCase().includes('invoice') ||
-        cleanLine.length < 3) {
-      continue;
+    const quantity = itemFields.Quantity?.valueNumber || 1;
+    const unitPrice = itemFields.UnitPrice?.valueNumber || 0;
+    const lineTotal = itemFields.Amount?.valueNumber || (quantity * unitPrice);
+    
+    return {
+      line_number: index + 1,
+      product_code: itemFields.ProductCode?.content || "",
+      description: itemFields.Description?.content || `Item ${index + 1}`,
+      quantity: quantity,
+      unit_cost: unitPrice,
+      line_total_ex_gst: lineTotal,
+      gst_amount: lineTotal * 0.10,
+      line_total_inc_gst: lineTotal * 1.10,
+      unit: itemFields.Unit?.content || "each"
+    };
+  });
+}
+
+async function enhanceWithAbacus(azureData) {
+  try {
+    const prompt = `Process this azure_data: ${JSON.stringify(azureData)}`;
+    
+    const response = await axios.post(ABACUS_CONFIG.endpoint, {
+      input_text: prompt
+    }, {
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${ABACUS_CONFIG.apiKey}`
+      },
+      timeout: 30000
+    });
+
+    if (response.data && response.data.response) {
+      try {
+        const enhancedData = JSON.parse(response.data.response);
+        return enhancedData;
+      } catch (parseError) {
+        console.warn('Failed to parse Abacus.ai response, using fallback');
+        return applyFallbackLogic(azureData);
+      }
+    } else {
+      throw new Error('Invalid response from Abacus.ai');
     }
 
-    // Pattern: anything with a price
-    const priceMatch = cleanLine.match(/(.+?)\s*\$?(\d+(?:\.\d{2})?)/);
-    if (priceMatch) {
-      const [, description, priceStr] = priceMatch;
-      const price = parseFloat(priceStr);
-      
-      if (price > 0.50 && price < 10000) { // Reasonable price range
-        // Look for quantity in the description
-        const qtyMatch = description.match(/(\d+(?:\.\d+)?)\s*(.+)/);
-        if (qtyMatch) {
-          const [, qtyStr, desc] = qtyMatch;
-          items.push({
-            description: desc.trim(),
-            quantity: parseFloat(qtyStr),
-            unitPrice: price,
-            unit: 'each'
-          });
-        } else {
-          items.push({
-            description: description.trim(),
-            quantity: 1,
-            unitPrice: price,
-            unit: 'each'
-          });
-        }
-        
-        console.log(`Found item: ${description.trim()} - $${price}`);
+  } catch (error) {
+    console.warn('Abacus.ai enhancement failed, using fallback logic:', error.message);
+    return applyFallbackLogic(azureData);
+  }
+}
+
+function applyFallbackLogic(azureData) {
+  console.log('Applying fallback business logic...');
+  
+  const enhancedLineItems = azureData.line_items.map(item => {
+    const category = categorizeProduct(item.description);
+    const markupPercent = BUSINESS_CONTEXT.product_categories[category]?.markup || 0.40;
+    const retailPrice = item.unit_cost * (1 + markupPercent);
+    
+    return {
+      ...item,
+      category: category,
+      markup: 1 + markupPercent,
+      retailPrice: retailPrice,
+      suggested_markup_percent: markupPercent * 100,
+      review_required: !item.product_code || item.product_code.length < 3
+    };
+  });
+  
+  return {
+    ...azureData,
+    line_items: enhancedLineItems,
+    processing_notes: [
+      "Data extracted with Azure Document Intelligence",
+      "Fallback business logic applied",
+      "Consider checking Abacus.ai connection"
+    ]
+  };
+}
+
+function categorizeProduct(description) {
+  if (!description) return 'groceries';
+  
+  const desc = description.toLowerCase();
+  
+  for (const [category, config] of Object.entries(BUSINESS_CONTEXT.product_categories)) {
+    if (category === 'groceries') continue;
+    
+    for (const keyword of config.keywords) {
+      if (desc.includes(keyword.toLowerCase())) {
+        return category;
       }
     }
   }
-
-  // If no items found, create one from any price
-  if (items.length === 0) {
-    const priceMatches = text.match(/\$(\d+(?:\.\d{2})?)/g);
-    if (priceMatches && priceMatches.length > 0) {
-      const price = parseFloat(priceMatches[0].replace('$', ''));
-      items.push({
-        description: 'Invoice Item',
-        quantity: 1,
-        unitPrice: price,
-        unit: 'each'
-      });
-    } else {
-      // Absolute fallback
-      items.push({
-        description: 'Text extracted but no prices found',
-        quantity: 1,
-        unitPrice: 0,
-        unit: 'each'
-      });
-    }
-  }
-
-  console.log(`Parsed ${items.length} items`);
-  return { supplier, items };
+  
+  return 'groceries';
 }
 
-function parseMultipartForm(body, boundary) {
+function formatForUI(enhancedData) {
+  // Format data to match your existing UI expectations
+  const items = enhancedData.line_items.map(item => ({
+    product: item.description,
+    quantity: item.quantity,
+    unit: item.unit || 'each',
+    costExGST: item.unit_cost,
+    category: item.category || 'Groceries',
+    markup: item.markup || 1.65,
+    retailPrice: item.retailPrice || (item.unit_cost * (item.markup || 1.65))
+  }));
+
+  return {
+    supplier: enhancedData.supplier?.name || 'Unknown Supplier',
+    items: items,
+    processingNotes: enhancedData.processing_notes || ['Processed with hybrid Azure + Abacus.ai'],
+    summary: {
+      totalItems: items.length,
+      totalCost: items.reduce((sum, item) => sum + item.costExGST, 0),
+      totalRetail: items.reduce((sum, item) => sum + item.retailPrice, 0)
+    }
+  };
+}
+
+function createFallbackData(file) {
+  // Fallback if Azure completely fails
+  return {
+    supplier: { name: "Processing Error" },
+    line_items: [{
+      description: "Unable to process invoice - check file format",
+      quantity: 1,
+      unit_cost: 0,
+      unit: "each"
+    }]
+  };
+}
+
+function parseMultipartForm(body, contentType) {
+  const boundary = contentType?.split('boundary=')[1];
+  if (!boundary) {
+    throw new Error('No boundary found in content-type header');
+  }
+
   const parts = {};
   const boundaryBuffer = Buffer.from(`--${boundary}`);
   const bodyBuffer = Buffer.from(body, 'base64');
