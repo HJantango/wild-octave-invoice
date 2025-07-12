@@ -9,8 +9,10 @@ const AZURE_CONFIG = {
 };
 
 const ABACUS_CONFIG = {
-  endpoint: 'https://api.abacus.ai/v1/deployments/14fa057fbc/execute',
-  apiKey: process.env.ABACUS_API_KEY
+  endpoint: 'https://api.abacus.ai/api/v0/getApiEndpoint',
+  apiKey: process.env.ABACUS_API_KEY || 's2_6f60d28791c94b7a99c837c0a8dc09d2',
+  deploymentId: '14fa057fbc',
+  deploymentToken: '041ee184499141258533dcca6d3a9aa0a6'
 };
 
 exports.handler = async (event, context) => {
@@ -364,28 +366,72 @@ function createMinimalFallback(file) {
 }
 
 async function enhanceWithAbacus(azureData) {
-  const prompt = `Process this azure_data: ${JSON.stringify(azureData)}`;
-  
-  const response = await axios.post(ABACUS_CONFIG.endpoint, {
-    input_text: prompt
-  }, {
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${ABACUS_CONFIG.apiKey}`
-    },
-    timeout: 30000
-  });
+  try {
+    // First get the API endpoint for predictions
+    console.log('Getting Abacus.ai API endpoint...');
+    const endpointResponse = await axios.get(ABACUS_CONFIG.endpoint, {
+      headers: {
+        'apiKey': ABACUS_CONFIG.apiKey
+      },
+      params: {
+        deploymentId: ABACUS_CONFIG.deploymentId,
+        deploymentToken: ABACUS_CONFIG.deploymentToken
+      }
+    });
 
-  if (response.data && response.data.response) {
-    try {
-      const enhancedData = JSON.parse(response.data.response);
-      return enhancedData;
-    } catch (parseError) {
-      console.warn('Failed to parse Abacus.ai response');
-      return applyFallbackLogic(azureData);
+    console.log('Endpoint response:', endpointResponse.data);
+
+    if (!endpointResponse.data.success || !endpointResponse.data.result) {
+      throw new Error('Failed to get API endpoint');
     }
-  } else {
-    throw new Error('Invalid response from Abacus.ai');
+
+    const predictionEndpoint = endpointResponse.data.result;
+    console.log('Got prediction endpoint:', predictionEndpoint);
+
+    // Now make the prediction call
+    const prompt = `Process this azure_data: ${JSON.stringify(azureData)}`;
+    
+    const predictionResponse = await axios.post(predictionEndpoint, {
+      input_text: prompt
+    }, {
+      headers: {
+        'Content-Type': 'application/json',
+        'apiKey': ABACUS_CONFIG.apiKey
+      },
+      timeout: 30000
+    });
+
+    console.log('Prediction response:', predictionResponse.data);
+
+    if (predictionResponse.data && predictionResponse.data.result) {
+      try {
+        const enhancedData = typeof predictionResponse.data.result === 'string' ? 
+          JSON.parse(predictionResponse.data.result) : predictionResponse.data.result;
+        return enhancedData;
+      } catch (parseError) {
+        console.warn('Failed to parse Abacus.ai result:', parseError);
+        return applyFallbackLogic(azureData);
+      }
+    } else if (predictionResponse.data && predictionResponse.data.response) {
+      try {
+        const enhancedData = JSON.parse(predictionResponse.data.response);
+        return enhancedData;
+      } catch (parseError) {
+        console.warn('Failed to parse Abacus.ai response');
+        return applyFallbackLogic(azureData);
+      }
+    } else {
+      console.log('Unexpected Abacus.ai prediction response format:', predictionResponse.data);
+      throw new Error('Invalid response from Abacus.ai prediction endpoint');
+    }
+
+  } catch (error) {
+    console.error('Abacus.ai API error:', error.message);
+    if (error.response) {
+      console.error('Response data:', error.response.data);
+      console.error('Response status:', error.response.status);
+    }
+    throw error;
   }
 }
 
