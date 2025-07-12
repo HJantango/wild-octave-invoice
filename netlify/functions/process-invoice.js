@@ -1,18 +1,23 @@
-// netlify/functions/process-invoice.js - Debug Version
+// netlify/functions/process-invoice.js - Azure Only Version (Reliable)
 const { DocumentAnalysisClient, AzureKeyCredential } = require("@azure/ai-form-recognizer");
-const axios = require('axios');
 
-// Configuration with debug logging
+// Configuration
 const AZURE_CONFIG = {
   endpoint: process.env.AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT,
   key: process.env.AZURE_DOCUMENT_INTELLIGENCE_KEY
 };
 
-const ABACUS_CONFIG = {
-  endpoint: 'https://api.abacus.ai/api/v0/getApiEndpoint',
-  apiKey: process.env.ABACUS_API_KEY || 's2_6f60d28791c94b7a99c837c0a8dc09d2',
-  deploymentId: '14fa057fbc',
-  deploymentToken: '041ee184499141258533dcca6d3a9aa0a6'
+// Business rules for Wild Octave Organics
+const BUSINESS_RULES = {
+  markup_rules: {
+    'Organic': 0.45,      // 45% markup
+    'Supplements': 0.50,   // 50% markup  
+    'Bulk': 0.35,         // 35% markup
+    'Cosmetics': 0.55,    // 55% markup
+    'Groceries': 0.40     // 40% default markup
+  },
+  gst_rate: 0.10,
+  currency: "AUD"
 };
 
 exports.handler = async (event, context) => {
@@ -36,16 +41,9 @@ exports.handler = async (event, context) => {
   }
 
   try {
-    console.log('🔄 Starting hybrid invoice processing...');
+    console.log('🔄 Starting Azure-powered invoice processing...');
     
-    // Debug environment variables
-    console.log('Environment check:', {
-      azureEndpoint: AZURE_CONFIG.endpoint ? 'SET' : 'MISSING',
-      azureKey: AZURE_CONFIG.key ? 'SET' : 'MISSING',
-      abacusKey: ABACUS_CONFIG.apiKey ? 'SET' : 'MISSING'
-    });
-    
-    // Validate environment variables
+    // Validate Azure credentials
     if (!AZURE_CONFIG.endpoint || !AZURE_CONFIG.key) {
       console.error('❌ Azure credentials missing');
       return {
@@ -61,7 +59,7 @@ exports.handler = async (event, context) => {
       };
     }
 
-    // Parse the uploaded file
+    // Parse uploaded file
     console.log('📄 Parsing uploaded file...');
     const parts = parseMultipartForm(event.body, event.headers['content-type']);
     const file = parts.file;
@@ -72,40 +70,21 @@ exports.handler = async (event, context) => {
 
     console.log(`Processing: ${file.filename}, size: ${file.data.length} bytes, type: ${file.contentType}`);
 
-    // Try Azure first, with detailed error handling
-    let azureData;
-    try {
-      console.log('🔍 Attempting Azure Document Intelligence...');
-      azureData = await extractWithAzure(file);
-      console.log('✅ Azure extraction successful');
-    } catch (azureError) {
-      console.error('❌ Azure extraction failed:', azureError.message);
-      // Try basic OCR fallback
-      azureData = await tryBasicOCR(file);
-    }
+    // Extract with Azure Document Intelligence
+    console.log('🔍 Extracting with Azure Document Intelligence...');
+    const azureData = await extractWithAzure(file);
     
-    // Apply business logic (try Abacus.ai, fallback to local logic)
-    let enhancedData;
-    try {
-      if (ABACUS_CONFIG.apiKey) {
-        console.log('🧠 Trying Abacus.ai enhancement...');
-        enhancedData = await enhanceWithAbacus(azureData);
-        console.log('✅ Abacus.ai enhancement successful');
-      } else {
-        console.log('⚠️ No Abacus.ai key, using fallback logic');
-        enhancedData = applyFallbackLogic(azureData);
-      }
-    } catch (abacusError) {
-      console.error('❌ Abacus.ai enhancement failed:', abacusError.message);
-      enhancedData = applyFallbackLogic(azureData);
-    }
+    // Apply business rules (local logic)
+    console.log('🧠 Applying Wild Octave business rules...');
+    const enhancedData = applyBusinessRules(azureData);
     
-    // Format for UI
+    // Format for your UI
     const formattedResult = formatForUI(enhancedData);
     
     console.log('🎉 Processing complete!', {
       supplier: formattedResult.supplier,
-      itemCount: formattedResult.items.length
+      itemCount: formattedResult.items.length,
+      totalCost: formattedResult.summary?.totalCost || 0
     });
     
     return {
@@ -122,10 +101,7 @@ exports.handler = async (event, context) => {
       body: JSON.stringify({ 
         error: error.message,
         details: 'Check function logs for more information',
-        debug: {
-          azureConfigured: !!(AZURE_CONFIG.endpoint && AZURE_CONFIG.key),
-          abacusConfigured: !!ABACUS_CONFIG.apiKey
-        }
+        timestamp: new Date().toISOString()
       })
     };
   }
@@ -133,209 +109,118 @@ exports.handler = async (event, context) => {
 
 async function extractWithAzure(file) {
   try {
-    console.log('Initializing Azure client...');
+    console.log('Initializing Azure Document Intelligence client...');
     const client = new DocumentAnalysisClient(
       AZURE_CONFIG.endpoint,
       new AzureKeyCredential(AZURE_CONFIG.key)
     );
 
-    // Convert file data
     const imageBuffer = Buffer.isBuffer(file.data) ? file.data : Buffer.from(file.data, 'base64');
-    console.log(`Image buffer prepared: ${imageBuffer.length} bytes`);
+    console.log(`Processing ${imageBuffer.length} byte file`);
     
-    // Try different models based on file type
-    let modelId = "prebuilt-invoice";
-    if (file.contentType && file.contentType.includes('image')) {
-      console.log('Image file detected, trying invoice model...');
-    } else if (file.filename && file.filename.toLowerCase().endsWith('.pdf')) {
-      console.log('PDF file detected, trying invoice model...');
-    }
-    
-    console.log(`Using model: ${modelId}`);
-    
-    // Start analysis
-    const poller = await client.beginAnalyzeDocument(
-      modelId,
-      imageBuffer,
-      {
+    // Try invoice model first
+    console.log('Attempting prebuilt-invoice model...');
+    try {
+      const invoicePoller = await client.beginAnalyzeDocument("prebuilt-invoice", imageBuffer, {
         locale: "en-AU"
-      }
-    );
-
-    console.log('Waiting for Azure analysis to complete...');
-    const result = await poller.pollUntilDone();
-    
-    console.log('Azure analysis complete:', {
-      documentsFound: result.documents?.length || 0,
-      pagesAnalyzed: result.pages?.length || 0
-    });
-    
-    if (!result.documents || result.documents.length === 0) {
-      console.log('No structured data found, trying text extraction...');
+      });
       
-      // Try basic text extraction if invoice model fails
+      const invoiceResult = await invoicePoller.pollUntilDone();
+      
+      if (invoiceResult.documents && invoiceResult.documents.length > 0) {
+        console.log('✅ Invoice model successful');
+        return transformAzureInvoiceData(invoiceResult.documents[0]);
+      } else {
+        console.log('⚠️ Invoice model found no structured data, trying text extraction...');
+        throw new Error('No invoice structure detected');
+      }
+    } catch (invoiceError) {
+      console.log('Invoice model failed, trying basic text extraction:', invoiceError.message);
+      
+      // Fallback to basic text extraction
       const textPoller = await client.beginAnalyzeDocument("prebuilt-read", imageBuffer);
       const textResult = await textPoller.pollUntilDone();
       
-      if (textResult.content) {
-        console.log(`Text extracted: ${textResult.content.length} characters`);
+      if (textResult.content && textResult.content.length > 20) {
+        console.log(`✅ Text extraction successful: ${textResult.content.length} characters`);
         return parseTextToInvoiceData(textResult.content);
       } else {
-        throw new Error("No text could be extracted from document");
+        throw new Error("No readable text found in document");
       }
     }
 
-    const invoice = result.documents[0];
-    return transformAzureData(invoice);
-
   } catch (error) {
-    console.error('Azure extraction detailed error:', error);
-    throw error;
+    console.error('Azure extraction failed:', error);
+    return createFallbackData(file, error.message);
   }
 }
 
-async function tryBasicOCR(file) {
-  console.log('Trying basic OCR fallback...');
+function transformAzureInvoiceData(invoice) {
+  const fields = invoice.fields || {};
   
-  try {
-    const client = new DocumentAnalysisClient(
-      AZURE_CONFIG.endpoint,
-      new AzureKeyCredential(AZURE_CONFIG.key)
-    );
-
-    const imageBuffer = Buffer.isBuffer(file.data) ? file.data : Buffer.from(file.data, 'base64');
-    
-    // Use basic read model
-    const poller = await client.beginAnalyzeDocument("prebuilt-read", imageBuffer);
-    const result = await poller.pollUntilDone();
-    
-    if (result.content && result.content.length > 10) {
-      console.log(`Basic OCR successful: ${result.content.length} characters`);
-      return parseTextToInvoiceData(result.content);
-    } else {
-      throw new Error("Basic OCR failed to extract readable text");
-    }
-    
-  } catch (error) {
-    console.error('Basic OCR failed:', error);
-    return createMinimalFallback(file);
-  }
-}
-
-function parseTextToInvoiceData(text) {
-  console.log('Parsing extracted text to invoice data...');
+  console.log('Transforming Azure invoice data...');
+  console.log('Available fields:', Object.keys(fields));
   
-  const lines = text.split('\n').filter(line => line.trim().length > 0);
-  const supplier = lines.find(line => 
-    line.length > 5 && 
-    !line.match(/^\d/) && 
-    !line.toLowerCase().includes('invoice') &&
-    !line.toLowerCase().includes('total')
-  ) || 'Unknown Supplier';
+  // Extract supplier info
+  const supplier = {
+    name: fields.VendorName?.content || fields.MerchantName?.content || "Unknown Supplier",
+    address: fields.VendorAddress?.content || fields.MerchantAddress?.content || "",
+    abn: fields.VendorTaxId?.content || ""
+  };
   
-  // Look for price patterns
-  const items = [];
-  const priceRegex = /\$?(\d+\.?\d*)/g;
+  // Extract invoice details
+  const invoice_details = {
+    number: fields.InvoiceId?.content || "",
+    date: fields.InvoiceDate?.content || "",
+    due_date: fields.DueDate?.content || "",
+    po_number: fields.PurchaseOrder?.content || ""
+  };
   
-  for (const line of lines) {
-    const prices = line.match(priceRegex);
-    if (prices && prices.length > 0) {
-      const price = parseFloat(prices[0].replace('$', ''));
-      if (price > 1 && price < 10000) {
-        const description = line.replace(/\$?[\d.]+/g, '').trim() || 'Invoice Item';
-        items.push({
-          line_number: items.length + 1,
-          product_code: '',
-          description: description,
-          quantity: 1,
-          unit_cost: price,
-          line_total_ex_gst: price,
-          gst_amount: price * 0.10,
-          line_total_inc_gst: price * 1.10,
-          unit: 'each'
-        });
-      }
-    }
-  }
+  // Extract line items
+  const line_items = extractLineItemsFromAzure(fields.Items?.valueArray || []);
   
-  if (items.length === 0) {
-    items.push({
-      line_number: 1,
-      product_code: '',
-      description: 'Text extracted but no items identified',
-      quantity: 1,
-      unit_cost: 0,
-      line_total_ex_gst: 0,
-      gst_amount: 0,
-      line_total_inc_gst: 0,
-      unit: 'each'
-    });
-  }
+  // Extract totals
+  const totals = {
+    subtotal_ex_gst: fields.SubTotal?.valueNumber || 0,
+    gst_amount: fields.TotalTax?.valueNumber || 0,
+    total_inc_gst: fields.InvoiceTotal?.valueNumber || 0
+  };
   
-  console.log(`Parsed ${items.length} items from text`);
+  console.log(`Extracted: supplier="${supplier.name}", ${line_items.length} items, total=$${totals.total_inc_gst}`);
   
   return {
-    supplier: { name: supplier },
-    invoice: { number: '', date: '', due_date: '', po_number: '' },
-    line_items: items,
-    totals: {
-      subtotal_ex_gst: items.reduce((sum, item) => sum + item.line_total_ex_gst, 0),
-      gst_amount: items.reduce((sum, item) => sum + item.gst_amount, 0),
-      total_inc_gst: items.reduce((sum, item) => sum + item.line_total_inc_gst, 0)
-    }
+    supplier,
+    invoice: invoice_details,
+    line_items,
+    totals,
+    extraction_method: "Azure Invoice Model"
   };
 }
 
-function transformAzureData(azureInvoice) {
-  const fields = azureInvoice.fields || {};
-  
-  return {
-    supplier: {
-      name: fields.VendorName?.content || "Unknown Supplier",
-      address: fields.VendorAddress?.content || "",
-      abn: fields.VendorTaxId?.content || ""
-    },
-    invoice: {
-      number: fields.InvoiceId?.content || "",
-      date: fields.InvoiceDate?.content || "",
-      due_date: fields.DueDate?.content || "",
-      po_number: fields.PurchaseOrder?.content || ""
-    },
-    line_items: extractLineItems(fields.Items?.valueArray || []),
-    totals: {
-      subtotal_ex_gst: fields.SubTotal?.valueNumber || 0,
-      gst_amount: fields.TotalTax?.valueNumber || 0,
-      total_inc_gst: fields.InvoiceTotal?.valueNumber || 0
-    }
-  };
-}
-
-function extractLineItems(azureItems) {
-  if (azureItems.length === 0) {
-    return [{
-      line_number: 1,
-      product_code: '',
-      description: 'No line items detected by Azure',
-      quantity: 1,
-      unit_cost: 0,
-      line_total_ex_gst: 0,
-      gst_amount: 0,
-      line_total_inc_gst: 0,
-      unit: 'each'
-    }];
+function extractLineItemsFromAzure(azureItems) {
+  if (!azureItems || azureItems.length === 0) {
+    console.log('No line items found in Azure invoice model');
+    return [];
   }
+  
+  console.log(`Processing ${azureItems.length} line items from Azure...`);
   
   return azureItems.map((item, index) => {
     const itemFields = item.valueObject || {};
     
+    const description = itemFields.Description?.content || 
+                       itemFields.ProductCode?.content || 
+                       `Item ${index + 1}`;
     const quantity = itemFields.Quantity?.valueNumber || 1;
     const unitPrice = itemFields.UnitPrice?.valueNumber || 0;
     const lineTotal = itemFields.Amount?.valueNumber || (quantity * unitPrice);
     
+    console.log(`Item ${index + 1}: "${description}" - Qty: ${quantity}, Unit: $${unitPrice}, Total: $${lineTotal}`);
+    
     return {
       line_number: index + 1,
       product_code: itemFields.ProductCode?.content || "",
-      description: itemFields.Description?.content || `Item ${index + 1}`,
+      description: description,
       quantity: quantity,
       unit_cost: unitPrice,
       line_total_ex_gst: lineTotal,
@@ -346,14 +231,131 @@ function extractLineItems(azureItems) {
   });
 }
 
-function createMinimalFallback(file) {
+function parseTextToInvoiceData(text) {
+  console.log('Parsing text to invoice data...');
+  
+  const lines = text.split('\n').filter(line => line.trim().length > 2);
+  console.log(`Processing ${lines.length} text lines`);
+  
+  // Find supplier (usually in first few lines)
+  let supplier = 'Unknown Supplier';
+  for (let i = 0; i < Math.min(10, lines.length); i++) {
+    const line = lines[i].trim();
+    if (line.length > 5 && 
+        !line.match(/^\d/) && 
+        !line.toLowerCase().includes('invoice') &&
+        !line.toLowerCase().includes('tax') &&
+        !line.toLowerCase().includes('total') &&
+        !line.toLowerCase().includes('date') &&
+        !line.match(/^\$/) &&
+        !line.match(/\d{2}\/\d{2}\/\d{4}/)) {
+      supplier = line;
+      console.log(`Found supplier: "${supplier}"`);
+      break;
+    }
+  }
+
+  // Extract line items from text
+  const items = [];
+  const processedLines = new Set();
+  
+  for (let i = 0; i < lines.length; i++) {
+    if (processedLines.has(i)) continue;
+    
+    const line = lines[i].trim();
+    
+    // Skip headers, totals, and metadata
+    if (line.toLowerCase().includes('total') ||
+        line.toLowerCase().includes('subtotal') ||
+        line.toLowerCase().includes('gst') ||
+        line.toLowerCase().includes('tax') ||
+        line.toLowerCase().includes('invoice') ||
+        line.toLowerCase().includes('date') ||
+        line.toLowerCase().includes('abn') ||
+        line.length < 3) {
+      continue;
+    }
+
+    // Look for price patterns
+    const priceMatches = line.match(/\$?([\d,]+\.?\d*)/g);
+    if (priceMatches && priceMatches.length > 0) {
+      const prices = priceMatches.map(p => parseFloat(p.replace(/[$,]/g, '')));
+      const mainPrice = prices.find(p => p > 1 && p < 10000);
+      
+      if (mainPrice) {
+        const description = line.replace(/\$?[\d,]+\.?\d*/g, '').trim() || `Line Item ${items.length + 1}`;
+        
+        // Look for quantity in description
+        const qtyMatch = description.match(/(\d+)\s*x?\s*(.+)/i);
+        let quantity = 1;
+        let cleanDescription = description;
+        
+        if (qtyMatch) {
+          quantity = parseInt(qtyMatch[1]);
+          cleanDescription = qtyMatch[2].trim();
+        }
+        
+        items.push({
+          line_number: items.length + 1,
+          product_code: '',
+          description: cleanDescription,
+          quantity: quantity,
+          unit_cost: mainPrice / quantity,
+          line_total_ex_gst: mainPrice,
+          gst_amount: mainPrice * 0.10,
+          line_total_inc_gst: mainPrice * 1.10,
+          unit: 'each'
+        });
+        
+        console.log(`Extracted item: "${cleanDescription}" - Qty: ${quantity}, Price: $${mainPrice}`);
+        processedLines.add(i);
+      }
+    }
+  }
+  
+  // If no items found, create a placeholder
+  if (items.length === 0) {
+    items.push({
+      line_number: 1,
+      product_code: '',
+      description: 'Text extracted but no clear line items found',
+      quantity: 1,
+      unit_cost: 0,
+      line_total_ex_gst: 0,
+      gst_amount: 0,
+      line_total_inc_gst: 0,
+      unit: 'each'
+    });
+  }
+  
+  const totalExGst = items.reduce((sum, item) => sum + item.line_total_ex_gst, 0);
+  const totalGst = items.reduce((sum, item) => sum + item.gst_amount, 0);
+  
+  console.log(`Text parsing result: ${items.length} items, total: $${totalExGst + totalGst}`);
+  
+  return {
+    supplier: { name: supplier },
+    invoice: { number: '', date: '', due_date: '', po_number: '' },
+    line_items: items,
+    totals: {
+      subtotal_ex_gst: totalExGst,
+      gst_amount: totalGst,
+      total_inc_gst: totalExGst + totalGst
+    },
+    extraction_method: "Text Parsing"
+  };
+}
+
+function createFallbackData(file, errorMessage) {
+  console.log('Creating fallback data due to extraction failure');
+  
   return {
     supplier: { name: "Processing Error" },
     invoice: { number: '', date: '', due_date: '', po_number: '' },
     line_items: [{
       line_number: 1,
       product_code: '',
-      description: `Unable to process ${file.filename} - try a clearer image or different format`,
+      description: `Unable to process ${file.filename} - ${errorMessage}`,
       quantity: 1,
       unit_cost: 0,
       line_total_ex_gst: 0,
@@ -361,99 +363,55 @@ function createMinimalFallback(file) {
       line_total_inc_gst: 0,
       unit: 'each'
     }],
-    totals: { subtotal_ex_gst: 0, gst_amount: 0, total_inc_gst: 0 }
+    totals: { subtotal_ex_gst: 0, gst_amount: 0, total_inc_gst: 0 },
+    extraction_method: "Error Fallback"
   };
 }
 
-async function enhanceWithAbacus(azureData) {
-  try {
-    // First get the API endpoint for predictions
-    console.log('Getting Abacus.ai API endpoint...');
-    const endpointResponse = await axios.get(ABACUS_CONFIG.endpoint, {
-      headers: {
-        'apiKey': ABACUS_CONFIG.apiKey
-      },
-      params: {
-        deploymentId: ABACUS_CONFIG.deploymentId,
-        deploymentToken: ABACUS_CONFIG.deploymentToken
-      }
-    });
-
-    console.log('Endpoint response:', endpointResponse.data);
-
-    if (!endpointResponse.data.success || !endpointResponse.data.result) {
-      throw new Error('Failed to get API endpoint');
-    }
-
-    const predictionEndpoint = endpointResponse.data.result;
-    console.log('Got prediction endpoint:', predictionEndpoint);
-
-    // Now make the prediction call
-    const prompt = `Process this azure_data: ${JSON.stringify(azureData)}`;
-    
-    const predictionResponse = await axios.post(predictionEndpoint, {
-      input_text: prompt
-    }, {
-      headers: {
-        'Content-Type': 'application/json',
-        'apiKey': ABACUS_CONFIG.apiKey
-      },
-      timeout: 30000
-    });
-
-    console.log('Prediction response:', predictionResponse.data);
-
-    if (predictionResponse.data && predictionResponse.data.result) {
-      try {
-        const enhancedData = typeof predictionResponse.data.result === 'string' ? 
-          JSON.parse(predictionResponse.data.result) : predictionResponse.data.result;
-        return enhancedData;
-      } catch (parseError) {
-        console.warn('Failed to parse Abacus.ai result:', parseError);
-        return applyFallbackLogic(azureData);
-      }
-    } else if (predictionResponse.data && predictionResponse.data.response) {
-      try {
-        const enhancedData = JSON.parse(predictionResponse.data.response);
-        return enhancedData;
-      } catch (parseError) {
-        console.warn('Failed to parse Abacus.ai response');
-        return applyFallbackLogic(azureData);
-      }
-    } else {
-      console.log('Unexpected Abacus.ai prediction response format:', predictionResponse.data);
-      throw new Error('Invalid response from Abacus.ai prediction endpoint');
-    }
-
-  } catch (error) {
-    console.error('Abacus.ai API error:', error.message);
-    if (error.response) {
-      console.error('Response data:', error.response.data);
-      console.error('Response status:', error.response.status);
-    }
-    throw error;
-  }
-}
-
-function applyFallbackLogic(azureData) {
-  console.log('Applying fallback business logic...');
+function applyBusinessRules(azureData) {
+  console.log('Applying Wild Octave Organics business rules...');
   
   const enhancedLineItems = azureData.line_items.map(item => {
     const category = categorizeProduct(item.description);
-    const markupPercent = getMarkupForCategory(category);
-    const retailPrice = item.unit_cost * (1 + markupPercent);
+    const markupPercent = BUSINESS_RULES.markup_rules[category];
+    const retailPriceExGst = item.unit_cost * (1 + markupPercent);
+    const retailPriceIncGst = retailPriceExGst * 1.10;
     
-    return {
+    const enhanced = {
       ...item,
       category: category,
       markup: 1 + markupPercent,
-      retailPrice: retailPrice
+      retailPrice: retailPriceIncGst,
+      suggested_markup_percent: markupPercent * 100,
+      review_required: !item.product_code || item.product_code.length < 2 || item.unit_cost === 0,
+      notes: []
     };
+    
+    // Add review notes
+    if (!item.product_code || item.product_code.length < 2) {
+      enhanced.notes.push("Missing product code");
+    }
+    if (item.unit_cost === 0) {
+      enhanced.notes.push("No unit cost detected");
+    }
+    if (item.description.length < 5) {
+      enhanced.notes.push("Description unclear");
+    }
+    
+    console.log(`Enhanced: "${item.description}" -> Category: ${category}, Markup: ${markupPercent * 100}%, Retail: $${retailPriceIncGst.toFixed(2)}`);
+    
+    return enhanced;
   });
   
   return {
     ...azureData,
-    line_items: enhancedLineItems
+    line_items: enhancedLineItems,
+    processing_notes: [
+      `Data extracted with Azure Document Intelligence (${azureData.extraction_method})`,
+      "Wild Octave Organics business rules applied",
+      `${enhancedLineItems.length} items processed`,
+      `${enhancedLineItems.filter(item => item.review_required).length} items flagged for review`
+    ]
   };
 }
 
@@ -462,23 +420,33 @@ function categorizeProduct(description) {
   
   const desc = description.toLowerCase();
   
-  if (desc.includes('organic') || desc.includes('bio')) return 'Organic';
-  if (desc.includes('vitamin') || desc.includes('supplement')) return 'Supplements';
-  if (desc.includes('bulk') || desc.includes('25kg') || desc.includes('20kg')) return 'Bulk';
-  if (desc.includes('cream') || desc.includes('oil') || desc.includes('soap')) return 'Cosmetics';
+  // Organic products
+  if (desc.includes('organic') || desc.includes('bio') || desc.includes('certified')) {
+    return 'Organic';
+  }
+  
+  // Supplements
+  if (desc.includes('vitamin') || desc.includes('supplement') || 
+      desc.includes('mineral') || desc.includes('probiotic') ||
+      desc.includes('capsule') || desc.includes('tablet')) {
+    return 'Supplements';
+  }
+  
+  // Bulk items
+  if (desc.includes('bulk') || desc.includes('25kg') || 
+      desc.includes('20kg') || desc.includes('wholesale') ||
+      desc.includes('sack') || desc.includes('bag')) {
+    return 'Bulk';
+  }
+  
+  // Cosmetics
+  if (desc.includes('cream') || desc.includes('oil') || 
+      desc.includes('soap') || desc.includes('shampoo') ||
+      desc.includes('lotion') || desc.includes('balm')) {
+    return 'Cosmetics';
+  }
   
   return 'Groceries';
-}
-
-function getMarkupForCategory(category) {
-  const markups = {
-    'Organic': 0.45,
-    'Supplements': 0.50,
-    'Bulk': 0.35,
-    'Cosmetics': 0.55,
-    'Groceries': 0.40
-  };
-  return markups[category] || 0.40;
 }
 
 function formatForUI(enhancedData) {
@@ -492,15 +460,20 @@ function formatForUI(enhancedData) {
     retailPrice: item.retailPrice || (item.unit_cost * (item.markup || 1.65))
   }));
 
+  const summary = {
+    totalItems: items.length,
+    totalCost: items.reduce((sum, item) => sum + (item.costExGST * item.quantity), 0),
+    totalRetail: items.reduce((sum, item) => sum + (item.retailPrice * item.quantity), 0),
+    itemsNeedingReview: enhancedData.line_items.filter(item => item.review_required).length
+  };
+
   return {
     supplier: enhancedData.supplier?.name || 'Unknown Supplier',
     items: items,
-    processingNotes: enhancedData.processing_notes || ['Processed with hybrid system'],
-    summary: {
-      totalItems: items.length,
-      totalCost: items.reduce((sum, item) => sum + (item.costExGST || 0), 0),
-      totalRetail: items.reduce((sum, item) => sum + (item.retailPrice || 0), 0)
-    }
+    processingNotes: enhancedData.processing_notes || ['Processed with Azure Document Intelligence'],
+    summary: summary,
+    extractionMethod: enhancedData.extraction_method,
+    reviewItems: enhancedData.line_items.filter(item => item.review_required)
   };
 }
 
